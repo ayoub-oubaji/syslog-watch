@@ -1,93 +1,139 @@
-# vlan-auditor
+# syslog-watch
 
-Audit Cisco IOS switch configurations for VLAN best-practice violations.
-Point it at one or more running-config files and get a clear,
-prioritized report of what to fix — before an attacker or an outage finds it first.
+A lightweight UDP syslog collector with SQLite storage and regex-based alerting.
+Point your switches, routers, and Linux servers at it and get a searchable
+message archive plus instant alerts on the events that matter.
+
+Built with only the Python standard library — no dependencies to install.
 
 ## Features
 
-- Parses Cisco IOS running-configs: VLAN database, per-interface switchport mode,
-  access VLAN, trunk allowed VLANs, and trunk native VLAN
-- 5 audit checks, each with a severity rating (HIGH / MEDIUM / LOW):
+- **UDP syslog server** (default port `5140`, so no root required; configurable)
+- **Parses RFC 3164** (`<PRI>Oct  7 10:30:00 host tag: message`) **and RFC 5424**
+  (`<PRI>1 2026-10-07T10:30:00Z host app proc msgid - message`); anything else
+  is stored raw — no message is ever lost
+- **SQLite storage** (`syslog.db`): every message with timestamp, hostname,
+  facility, severity, tag, and message text
+- **Regex alerting**: rules in `rules.json` (`{name, pattern, severity}`);
+  matches print an `ALERT` to stderr and are recorded in an `alerts` table
+- **Daily report** (`--report`): message counts by severity and hostname,
+  plus the most-triggered alert rules
 
-| Check | Severity | What it finds |
-|---|---|---|
-| `ACCESS_VLAN_1` | HIGH | Access port in VLAN 1 (explicit or by default) — VLAN hopping risk |
-| `NATIVE_VLAN_1` | MEDIUM | Trunk with native VLAN 1 (explicit or default) — use a dedicated unused VLAN |
-| `TRUNK_ALLOW_ALL` | MEDIUM | Trunk carrying all VLANs 1–4094 (no pruning configured) |
-| `ACCESS_NO_EXPLICIT_MODE` | MEDIUM | `switchport access vlan` set without `switchport mode access` (DTP risk) |
-| `UNUSED_VLAN` | LOW | VLAN defined in the database but not used on any port |
+## Architecture
 
-- Human-readable text report on stdout, plus optional JSON report (`--json`)
-- Handles real-world syntax: `allowed vlan add`, `except`, ranges (`10-20`),
-  voice VLANs, SVIs, shutdown ports, and routed (`no switchport`) interfaces
-- Pure Python standard library — no dependencies
+```
+                         +---------------------------+
+  Cisco switch   UDP     |       syslog-watch        |
+  --------------+------->|  UDP :5140  (socketserver)|
+  Cisco router  UDP     |                           |--> SQLite syslog.db
+  --------------+------->|  RFC 3164 / 5424 parser   |      messages, alerts
+  Linux server  UDP     |                           |
+  --------------+------->|  regex alert engine       |
+                         |  (rules.json)             |
+                         +-------------+-------------+
+                                       |
+                              ALERT -> stderr
+```
 
-## Usage
+## Quick start
 
 ```bash
-# Audit one or more configs
-python3 vlan_audit.py samples/core-sw.cfg samples/access-sw.cfg
+# Terminal 1 — start the collector
+python3 syslog_watch.py
 
-# Also write a JSON report
-python3 vlan_audit.py samples/core-sw.cfg --json report.json
+# Terminal 2 — send a burst of realistic demo traffic
+python3 send_test_logs.py
+
+# Terminal 1 — print today's summary (Ctrl+C the server first, or use --db)
+python3 syslog_watch.py --report
 ```
 
-## Example output
+## Example session
 
 ```
-$ python3 vlan_audit.py samples/core-sw.cfg samples/access-sw.cfg
-VLAN Audit Report
-============================================================
+$ python3 syslog_watch.py &
+syslog-watch listening on UDP port 5140 (5 alert rules loaded)
+database: syslog.db   (Ctrl+C to stop)
 
-Device: CORE-SW  (source: samples/core-sw.cfg)
-  Interfaces audited : 4 (trunk: 2, access: 2)
-  VLANs defined      : 5
+$ python3 send_test_logs.py
+sent: Oct  7 11:00:01 core-sw-01 %LINK-3-UPDOWN: Interface GigabitEthernet1/0/12, ch
+...
+done: 15 messages sent to 127.0.0.1:5140
 
-Device: ACCESS-SW  (source: samples/access-sw.cfg)
-  Interfaces audited : 5 (trunk: 1, access: 4)
-  VLANs defined      : 4
+ALERT [Interface up/down] core-sw-01 (err): Interface GigabitEthernet1/0/12, changed state to down
+ALERT [SSH failed login] edge-rtr-01 (warning): Login failed [user: admin] [Source: 203.0.113.45] [localport: 22] [Reason: Login Authentication Failed]
+ALERT [Configuration change] edge-rtr-01 (notice): Configured from console by admin on vty0 (203.0.113.45)
+ALERT [OSPF neighbor change] core-sw-01 (notice): Process 10, Nbr 10.255.1.2 on Vlan20 from FULL to DOWN, Neighbor Down: Dead timer expired
+ALERT [Critical severity catch-all] core-sw-01 (crit): Memory allocation of 1024 bytes failed from 0x1234ABCD, alignment 0
 
-Findings: 8
-------------------------------------------------------------
-[HIGH] ACCESS_VLAN_1
-    CORE-SW / GigabitEthernet0/3: Access port explicitly assigned to VLAN 1 — move user ports off the default VLAN 1.
-[MEDIUM] NATIVE_VLAN_1
-    CORE-SW / GigabitEthernet0/1: Trunk native VLAN is 1 (explicitly set) — use a dedicated unused VLAN instead.
-[MEDIUM] TRUNK_ALLOW_ALL
-    CORE-SW / GigabitEthernet0/1: No 'switchport trunk allowed vlan' list — trunk carries all VLANs 1-4094. Prune to only required VLANs.
-[LOW] UNUSED_VLAN
-    CORE-SW / VLAN 99: VLAN 99 (Unused-VLAN) is defined but not used on any port — remove it to keep the VLAN database clean.
-[HIGH] ACCESS_VLAN_1
-    ACCESS-SW / FastEthernet0/1: Access port defaults to VLAN 1 (no 'switchport access vlan' configured) — move user ports off the default VLAN 1.
-[MEDIUM] ACCESS_NO_EXPLICIT_MODE
-    ACCESS-SW / FastEthernet0/2: Has 'switchport access vlan' but no 'switchport mode access' — port relies on DTP negotiation; set the mode explicitly.
-[MEDIUM] NATIVE_VLAN_1
-    ACCESS-SW / GigabitEthernet0/1: Trunk native VLAN is 1 (defaults (no 'switchport trunk native vlan' configured)) — use a dedicated unused VLAN instead.
-[LOW] UNUSED_VLAN
-    ACCESS-SW / VLAN 40: VLAN 40 (Old-VLAN) is defined but not used on any port — remove it to keep the VLAN database clean.
-------------------------------------------------------------
-Summary: 2 HIGH, 4 MEDIUM, 2 LOW
+$ python3 syslog_watch.py --report
+=== syslog-watch daily report ===
+Messages today : 15
+Alerts today   : 12
+
+By severity:
+  crit     1
+  err      1
+  warning  2
+  notice   7
+  info     3
+  debug    1
+
+By hostname:
+  core-sw-01           8
+  edge-rtr-01          7
+
+Top alert rules:
+  Interface up/down            4
+  SSH failed login             3
+  OSPF neighbor change         2
+  Configuration change         2
+  Critical severity catch-all  1
 ```
 
-## Sample configs
+## Alert rule format
 
-The `samples/` directory contains two realistic Cisco 2960 configs
-(`core-sw.cfg`, `access-sw.cfg`) that deliberately demonstrate every check,
-so you can see the full report on the first run.
+`rules.json`:
+
+```json
+{
+  "rules": [
+    {"name": "SSH failed login", "pattern": "Failed (password|publickey)|authentication failure|Invalid user|LOGIN_FAILED", "severity": 6},
+    {"name": "Interface up/down", "pattern": "%LINK-3-UPDOWN|%LINEPROTO-5-UPDOWN", "severity": 5},
+    {"name": "Critical severity catch-all", "pattern": ".*", "severity": 2}
+  ]
+}
+```
+
+- `pattern` — Python regex matched against the raw syslog datagram.
+- `severity` — the *least severe* level that still triggers the rule: a message
+  triggers when its severity number is **<=** the rule's severity
+  (lower number = more severe: 0=emerg … 7=debug).
+- A message can trigger several rules; each match is recorded separately.
+
+## Pointing real devices at it
+
+- **Cisco IOS**: `logging host <collector-ip> transport udp port 5140`
+- **Linux (rsyslog)**: add `*.* @<collector-ip>:5140` to `/etc/rsyslog.conf`
+  (use `@@` for TCP — note this collector is UDP-only)
+
+## CLI reference
+
+```
+python3 syslog_watch.py [--port 5140] [--db syslog.db] [--rules rules.json]
+python3 syslog_watch.py --report [--db syslog.db]
+```
+
+| Flag      | Default      | Description                              |
+|-----------|--------------|------------------------------------------|
+| `--port`  | `5140`       | UDP port to listen on                    |
+| `--db`    | `syslog.db`  | SQLite database file                     |
+| `--rules` | `rules.json` | Alert rules file                         |
+| `--report`| —            | Print today's summary and exit           |
 
 ## Requirements
 
-- Python 3.8+
-
-## How it works
-
-1. **Parse** — walks each config, extracting the VLAN database
-   (`vlan <id>` / `name`) and every `interface` block's switchport settings.
-2. **Audit** — applies the 5 checks, tracking which VLANs are actually
-   referenced (access, voice, native, trunk-allowed, SVI).
-3. **Report** — prints findings sorted by severity, and optionally
-   writes structured JSON for automation pipelines.
+- Python 3.8+ (standard library only: `socketserver`, `sqlite3`, `re`, `argparse`, `json`)
 
 ## License
 
