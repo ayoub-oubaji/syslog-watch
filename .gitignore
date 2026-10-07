@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
-report.json
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

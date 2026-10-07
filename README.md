@@ -1,141 +1,93 @@
-# topo-mapper — Network Topology Mapper
+# vlan-auditor
 
-Discover the topology of a Cisco network automatically using CDP,
-and render it as structured data plus a Graphviz diagram.
-
-## How CDP discovery works
-
-CDP (Cisco Discovery Protocol) is a Layer-2 protocol that lets directly
-connected Cisco devices announce themselves to each other. Every device
-keeps a table of its neighbors, visible with:
-
-```
-show cdp neighbors detail
-```
-
-Each entry contains the neighbor's device ID, management IP, hardware
-platform, the local interface, and the neighbor's outgoing interface.
-topo-mapper:
-
-1. SSHs into each seed device from the inventory (via Netmiko)
-2. Runs `show cdp neighbors detail` and parses every entry with regex
-3. Crawls one level deep — discovered neighbors that advertise an IP are
-   queried too (unreachable devices are skipped gracefully)
-4. Deduplicates bidirectional links (a link seen from both ends is stored once)
-5. Writes `topology.json` (nodes + links) and `topology.dot` (Graphviz)
-
-> **Note:** CDP must be enabled on the devices (`cdp run` — it is on by
-> default on most Cisco switches/routers). The SSH user needs privilege
-> level 15 or an account allowed to run `show` commands.
+Audit Cisco IOS switch configurations for VLAN best-practice violations.
+Point it at one or more running-config files and get a clear,
+prioritized report of what to fix — before an attacker or an outage finds it first.
 
 ## Features
 
-- CDP neighbor discovery from seed devices, plus one-level crawl
-- Robust parsing: full and abbreviated interface names (`GigabitEthernet0/1`,
-  `Gi0/1`, `Fa0/5`, `Te1/0/1`, …) are normalized to a canonical short form
-- Handles entries without an IP (e.g. IP phones) and non-standard port IDs
-- Bidirectional-link deduplication
-- Per-device error handling: auth failures and timeouts are reported,
-  discovery continues with the remaining devices
-- Outputs: `topology.json` and Graphviz `topology.dot`
-- `--no-crawl` mode to query only the seed devices
+- Parses Cisco IOS running-configs: VLAN database, per-interface switchport mode,
+  access VLAN, trunk allowed VLANs, and trunk native VLAN
+- 5 audit checks, each with a severity rating (HIGH / MEDIUM / LOW):
+
+| Check | Severity | What it finds |
+|---|---|---|
+| `ACCESS_VLAN_1` | HIGH | Access port in VLAN 1 (explicit or by default) — VLAN hopping risk |
+| `NATIVE_VLAN_1` | MEDIUM | Trunk with native VLAN 1 (explicit or default) — use a dedicated unused VLAN |
+| `TRUNK_ALLOW_ALL` | MEDIUM | Trunk carrying all VLANs 1–4094 (no pruning configured) |
+| `ACCESS_NO_EXPLICIT_MODE` | MEDIUM | `switchport access vlan` set without `switchport mode access` (DTP risk) |
+| `UNUSED_VLAN` | LOW | VLAN defined in the database but not used on any port |
+
+- Human-readable text report on stdout, plus optional JSON report (`--json`)
+- Handles real-world syntax: `allowed vlan add`, `except`, ranges (`10-20`),
+  voice VLANs, SVIs, shutdown ports, and routed (`no switchport`) interfaces
+- Pure Python standard library — no dependencies
 
 ## Usage
 
 ```bash
-pip install -r requirements.txt
+# Audit one or more configs
+python3 vlan_audit.py samples/core-sw.cfg samples/access-sw.cfg
 
-# 1. Create your inventory from the template
-cp devices.example.json devices.json
-# 2. Edit devices.json with your real device IPs/names
-# 3. Run discovery
-python3 topo_map.py
-
-# Custom inventory / output dir / username
-python3 topo_map.py --inventory lab.json --out-dir ./out --username admin
-
-# Only query the seed devices, don't crawl neighbors
-python3 topo_map.py --no-crawl
+# Also write a JSON report
+python3 vlan_audit.py samples/core-sw.cfg --json report.json
 ```
 
-Render the diagram (requires Graphviz):
-
-```bash
-dot -Tpng topology-out/topology.dot -o topology.png
-```
-
-## Example `topology.json`
-
-```json
-{
-  "nodes": [
-    {"name": "SwitchA", "ip": "192.168.1.3", "platform": "cisco WS-C2960-24TT-L"},
-    {"name": "SwitchB", "ip": "192.168.1.2", "platform": "cisco WS-C2960-24TT-L"},
-    {"name": "RouterA", "ip": "192.168.1.1", "platform": "cisco ISR4321/K9"}
-  ],
-  "links": [
-    {"node_a": "SwitchA", "interface_a": "Gi0/1",
-     "node_b": "SwitchB", "interface_b": "Gi0/2"},
-    {"node_a": "RouterA", "interface_a": "Gi0/0",
-     "node_b": "SwitchA", "interface_b": "Gi0/2"}
-  ]
-}
-```
-
-The generated `.dot` file describes the same graph with per-node labels
-(name, platform, IP) and per-link interface labels, e.g.:
-
-```dot
-graph topology {
-    rankdir=LR;
-    node [shape=box, style="rounded,filled", fillcolor="#e8f0fe"];
-
-    "SwitchA" [label="SwitchA\ncisco WS-C2960-24TT-L\n192.168.1.3"];
-    "SwitchB" [label="SwitchB\ncisco WS-C2960-24TT-L\n192.168.1.2"];
-
-    "SwitchA" -- "SwitchB" [label="Gi0/1 -- Gi0/2"];
-}
-```
-
-## Project layout
+## Example output
 
 ```
-topo-mapper/
-├── topo_map.py            # discovery, parsing, output writers, CLI
-├── devices.example.json   # inventory template (copy to devices.json)
-├── requirements.txt       # netmiko
-├── samples/               # realistic `show cdp neighbors detail` captures
-├── tests/
-│   └── test_parser.py     # self-test: parsing, dedup, JSON/DOT output
-├── README.md
-├── LICENSE
-└── .gitignore
+$ python3 vlan_audit.py samples/core-sw.cfg samples/access-sw.cfg
+VLAN Audit Report
+============================================================
+
+Device: CORE-SW  (source: samples/core-sw.cfg)
+  Interfaces audited : 4 (trunk: 2, access: 2)
+  VLANs defined      : 5
+
+Device: ACCESS-SW  (source: samples/access-sw.cfg)
+  Interfaces audited : 5 (trunk: 1, access: 4)
+  VLANs defined      : 4
+
+Findings: 8
+------------------------------------------------------------
+[HIGH] ACCESS_VLAN_1
+    CORE-SW / GigabitEthernet0/3: Access port explicitly assigned to VLAN 1 — move user ports off the default VLAN 1.
+[MEDIUM] NATIVE_VLAN_1
+    CORE-SW / GigabitEthernet0/1: Trunk native VLAN is 1 (explicitly set) — use a dedicated unused VLAN instead.
+[MEDIUM] TRUNK_ALLOW_ALL
+    CORE-SW / GigabitEthernet0/1: No 'switchport trunk allowed vlan' list — trunk carries all VLANs 1-4094. Prune to only required VLANs.
+[LOW] UNUSED_VLAN
+    CORE-SW / VLAN 99: VLAN 99 (Unused-VLAN) is defined but not used on any port — remove it to keep the VLAN database clean.
+[HIGH] ACCESS_VLAN_1
+    ACCESS-SW / FastEthernet0/1: Access port defaults to VLAN 1 (no 'switchport access vlan' configured) — move user ports off the default VLAN 1.
+[MEDIUM] ACCESS_NO_EXPLICIT_MODE
+    ACCESS-SW / FastEthernet0/2: Has 'switchport access vlan' but no 'switchport mode access' — port relies on DTP negotiation; set the mode explicitly.
+[MEDIUM] NATIVE_VLAN_1
+    ACCESS-SW / GigabitEthernet0/1: Trunk native VLAN is 1 (defaults (no 'switchport trunk native vlan' configured)) — use a dedicated unused VLAN instead.
+[LOW] UNUSED_VLAN
+    ACCESS-SW / VLAN 40: VLAN 40 (Old-VLAN) is defined but not used on any port — remove it to keep the VLAN database clean.
+------------------------------------------------------------
+Summary: 2 HIGH, 4 MEDIUM, 2 LOW
 ```
 
-## Testing
+## Sample configs
 
-Live SSH discovery needs real devices, but everything else is tested:
-
-```bash
-python3 tests/test_parser.py   # 31 checks: parsing, dedup, JSON, DOT
-```
-
-The test feeds two realistic CDP captures through the parser (including
-abbreviated interface names, a neighbor with no IP, and a reverse link to
-verify deduplication) and validates the generated JSON schema and DOT format.
-
-## Security notes
-
-- `devices.json` (real IPs/hostnames) is git-ignored — only the
-  `.example.json` template is committed.
-- The SSH password is read with `getpass` and never written to disk.
+The `samples/` directory contains two realistic Cisco 2960 configs
+(`core-sw.cfg`, `access-sw.cfg`) that deliberately demonstrate every check,
+so you can see the full report on the first run.
 
 ## Requirements
 
 - Python 3.8+
-- netmiko (`pip install -r requirements.txt`)
-- SSH access to the target Cisco devices
-- Graphviz (`dot`) only if you want to render the diagram
+
+## How it works
+
+1. **Parse** — walks each config, extracting the VLAN database
+   (`vlan <id>` / `name`) and every `interface` block's switchport settings.
+2. **Audit** — applies the 5 checks, tracking which VLANs are actually
+   referenced (access, voice, native, trunk-allowed, SVI).
+3. **Report** — prints findings sorted by severity, and optionally
+   writes structured JSON for automation pipelines.
 
 ## License
 
